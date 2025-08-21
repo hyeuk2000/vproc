@@ -1,0 +1,150 @@
+###################################################################
+# Makefile for Virtual Processor testcode in VCS (Fixed: no duplicates in lib)
+#
+# - Flow:  PIC objects → libvproc.a → VProcVCS.so → VCS loads via -loadvpi :register_vpi_tasks
+# - Fixes: remove old archive before (re)creating lib to avoid stale *.o entries
+# - Verilog macro: +define+VPROC_BYTE_ENABLE
+###################################################################
+
+#----------------------------- Tool/Env ---------------------------------------
+export VCS_ARCH_OVERRIDE ?= linux
+
+CC      ?= gcc
+CXX     ?= g++
+AR      ?= ar
+
+ifndef VCS_HOME
+  $(error VCS_HOME is not set. Please set it to your VCS installation path.)
+endif
+
+#--------------------------- User configuration --------------------------------
+HDL                 ?= VERILOG
+OPTFLAG             ?= -g
+USRFLAGS            ?=
+USRCDIR             ?= usercode
+TESTDIR             ?= .
+ARCHFLAG            ?= -m64              # or -m32 if you must
+
+# Space-separated user code list (names only, under $(USRCDIR))
+USER_C              ?= VUserMain0.c VUserMain1.cpp
+
+#--------------------------- Internal paths ------------------------------------
+SRCDIR              := ../code
+VOBJDIR             := $(TESTDIR)/obj
+
+# Outputs
+VLIB                := $(TESTDIR)/libvproc.a
+VPI_SO              := $(TESTDIR)/VProcVCS.so
+
+#---------------------------- Sources/Objects ----------------------------------
+VPROC_C_SOURCES     := $(SRCDIR)/VSched.c $(SRCDIR)/VUser.c
+USER_C_SOURCES      := $(addprefix $(USRCDIR)/, $(USER_C))
+
+VPROC_C_OBJS        := $(patsubst $(SRCDIR)/%.c,$(VOBJDIR)/%.o,$(filter %.c,$(VPROC_C_SOURCES)))
+VPROC_CPP_OBJS      := $(patsubst $(SRCDIR)/%.cpp,$(VOBJDIR)/%.o,$(filter %.cpp,$(VPROC_C_SOURCES)))
+USER_C_OBJS         := $(patsubst $(USRCDIR)/%.c,$(VOBJDIR)/usr_%.o,$(filter %.c,$(USER_C_SOURCES)))
+USER_CPP_OBJS       := $(patsubst $(USRCDIR)/%.cpp,$(VOBJDIR)/usr_%.o,$(filter %.cpp,$(USER_C_SOURCES)))
+
+OBJS                := $(VPROC_C_OBJS) $(VPROC_CPP_OBJS) $(USER_C_OBJS) $(USER_CPP_OBJS)
+
+#------------------------------ Flags ------------------------------------------
+CSTD                ?= -std=c11
+CXXSTD              ?= -std=c++11
+SIMINCLUDEFLAG      := -I$(VCS_HOME)/include
+INCLUDES            := -I$(SRCDIR) -I$(USRCDIR) $(SIMINCLUDEFLAG)
+
+# (Optional) silence C++ const-string → char* warnings from vpi_printf signature
+CXXWARNFIX          ?= -Wno-write-strings
+
+CFLAGS              ?= $(OPTFLAG) $(ARCHFLAG) -fPIC $(CSTD)   $(USRFLAGS) $(INCLUDES)
+CXXFLAGS            ?= $(OPTFLAG) $(ARCHFLAG) -fPIC $(CXXSTD) $(USRFLAGS) $(CXXWARNFIX) $(INCLUDES)
+
+# Shared object link flags (Linux)
+LDFLAGS_SO          ?= -shared $(ARCHFLAG) -lpthread -lrt -rdynamic
+
+# VCS flags (correct macro: BYTE_ENABLE)
+VCSFLAGS            ?= -full64 -sverilog +v2k \
+                       -debug_acc+all \
+                       +define+VPROC_BURST_IF \
+                       +define+VPROC_BYTE_ENABLE \
+                       +incdir+../ \
+                       -top test \
+                       -l compile.log
+SIMVFLAGS           ?= -l run.log
+
+VLOG_FILELIST       ?= test.vc
+
+#------------------------------ Phony ------------------------------------------
+.PHONY: all compile run sim rungui gui clean show dirs rebuild clobber
+
+all: compile
+
+rebuild: clobber compile
+
+show:
+	@echo "SRCDIR=$(SRCDIR)"
+	@echo "USRCDIR=$(USRCDIR)"
+	@echo "VOBJDIR=$(VOBJDIR)"
+	@echo "VLIB=$(VLIB)"
+	@echo "VPI_SO=$(VPI_SO)"
+	@echo "VCS_HOME=$(VCS_HOME)"
+	@echo "VLOG_FILELIST=$(VLOG_FILELIST)"
+	@echo "USER_C_SOURCES=$(USER_C_SOURCES)"
+
+dirs:
+	@mkdir -p $(VOBJDIR)
+
+#------------------------------ Build rules ------------------------------------
+$(VOBJDIR)/%.o: $(SRCDIR)/%.c | dirs
+	$(CC) -c $(CFLAGS) -o $@ $<
+
+$(VOBJDIR)/%.o: $(SRCDIR)/%.cpp | dirs
+	$(CXX) -c $(CXXFLAGS) -o $@ $<
+
+$(VOBJDIR)/usr_%.o: $(USRCDIR)/%.c | dirs
+	$(CC) -c $(CFLAGS) -o $@ $<
+
+$(VOBJDIR)/usr_%.o: $(USRCDIR)/%.cpp | dirs
+	$(CXX) -c $(CXXFLAGS) -o $@ $<
+
+# Recreate archive from scratch to avoid stale *.o entries (fix for 'multiple definition')
+$(VLIB): $(OBJS) | dirs
+	@rm -f $@
+	$(AR) rcs $@ $(OBJS)
+
+$(VPI_SO): $(VLIB)
+	$(CXX) $(LDFLAGS_SO) \
+	  -Wl,-whole-archive $(VLIB) -Wl,-no-whole-archive \
+	  -o $@
+
+# HDL compile + VPI load (entry: register_vpi_tasks in VSched.c)
+compile: $(VPI_SO)
+	@echo "### Compiling HDL and linking VPI library with VCS..."
+	@vcs $(VCSFLAGS) -f $(VLOG_FILELIST) \
+	   -loadvpi ./$(notdir $(VPI_SO)):register_vpi_tasks
+
+#------------------------------ Run rules --------------------------------------
+sim: compile
+	@./simv -gui $(SIMVFLAGS)
+
+run: compile
+	@./simv $(SIMVFLAGS)
+
+rungui: compile
+	@if [ -e wave.do ]; then \
+		./simv -gui -do wave.do $(SIMVFLAGS); \
+	else \
+		./simv -gui $(SIMVFLAGS); \
+	fi
+
+gui: rungui
+
+#------------------------------ Clean ------------------------------------------
+clean:
+	@rm -rf $(VOBJDIR) $(VLIB) $(VPI_SO) \
+	        simv simv.daidir csrc ucli.key \
+	        *.log DVEfiles/ *.vpd *.vcd *.fsdb *.vcs.* *.ddb *.simv.*
+
+# Deep clean convenience
+clobber: clean
+	@rm -f $(TESTDIR)/libvproc.a $(TESTDIR)/VProcVCS.so
