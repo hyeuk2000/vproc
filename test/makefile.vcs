@@ -1,150 +1,120 @@
 ###################################################################
-# Makefile for Virtual Processor testcode in VCS (Fixed: no duplicates in lib)
+# Makefile for Virtual Processor SystemVerilog testcode in VCS
 #
-# - Flow:  PIC objects → libvproc.a → VProcVCS.so → VCS loads via -loadvpi :register_vpi_tasks
-# - Fixes: remove old archive before (re)creating lib to avoid stale *.o entries
-# - Verilog macro: +define+VPROC_BYTE_ENABLE
+# This Makefile acts as a wrapper around makefile.common, setting
+# up VCS-specific variables and defining VCS execution rules.
 ###################################################################
 
-#----------------------------- Tool/Env ---------------------------------------
-export VCS_ARCH_OVERRIDE ?= linux
+#------------------------------------------------------
+# User overridable definitions (동일하게 유지)
+#------------------------------------------------------
+MAX_NUM_VPROC     = 64
+USRFLAGS          =
+SRCDIR            = ../code
+USRCDIR           = usercode
+TESTDIR           = .
+VOBJDIR           = $(TESTDIR)/obj
 
-CC      ?= gcc
-CXX     ?= g++
-AR      ?= ar
+# User test source code file list
+USER_C            = VUserMain0.c VUserMain1.cpp
 
+#------------------------------------------------------
+# VCS Specific Settings (가장 중요한 부분)
+#------------------------------------------------------
+
+# 1. VCS_HOME 환경 변수 확인
 ifndef VCS_HOME
   $(error VCS_HOME is not set. Please set it to your VCS installation path.)
 endif
 
-#--------------------------- User configuration --------------------------------
-HDL                 ?= VERILOG
-OPTFLAG             ?= -g
-USRFLAGS            ?=
-USRCDIR             ?= usercode
-TESTDIR             ?= .
-ARCHFLAG            ?= -m64              # or -m32 if you must
+# 2. 'makefile.common'이 사용할 변수들을 VCS에 맞게 설정
+ARCHFLAG          = -m64
+OPTFLAG           = -g
+HDLLANGUAGE       = 
 
-# Space-separated user code list (names only, under $(USRCDIR))
-USER_C              ?= VUserMain0.c VUserMain1.cpp
+# *** 핵심 변경점 (1) ***
+# SIMULATOR 변수를 정의하여 C 코드 내에서 VCS용 VPI 코드가 활성화되도록 함
+# (VSched.c 파일 안에 #ifdef VCS ... #endif 와 같은 코드가 있을 것임)
+SIMULATOR         = -DVCS
 
-#--------------------------- Internal paths ------------------------------------
-SRCDIR              := ../code
-VOBJDIR             := $(TESTDIR)/obj
+# VCS VPI 헤더 파일 경로 설정
+SIMINCLUDEFLAG    = -I$(VCS_HOME)/include
 
-# Outputs
-VLIB                := $(TESTDIR)/libvproc.a
-VPI_SO              := $(TESTDIR)/VProcVCS.so
+# VCS 링크 시 필요한 특수 플래그 (필요 시 추가)
+SIMFLAGSSO        =
 
-#---------------------------- Sources/Objects ----------------------------------
-VPROC_C_SOURCES     := $(SRCDIR)/VSched.c $(SRCDIR)/VUser.c
-USER_C_SOURCES      := $(addprefix $(USRCDIR)/, $(USER_C))
+# Get OS type
+OSTYPE:=$(shell uname)
 
-VPROC_C_OBJS        := $(patsubst $(SRCDIR)/%.c,$(VOBJDIR)/%.o,$(filter %.c,$(VPROC_C_SOURCES)))
-VPROC_CPP_OBJS      := $(patsubst $(SRCDIR)/%.cpp,$(VOBJDIR)/%.o,$(filter %.cpp,$(VPROC_C_SOURCES)))
-USER_C_OBJS         := $(patsubst $(USRCDIR)/%.c,$(VOBJDIR)/usr_%.o,$(filter %.c,$(USER_C_SOURCES)))
-USER_CPP_OBJS       := $(patsubst $(USRCDIR)/%.cpp,$(VOBJDIR)/usr_%.o,$(filter %.cpp,$(USER_C_SOURCES)))
+# *** 핵심 변경점 (2) ***
+# VCS 컴파일 및 시뮬레이션에 사용할 플래그 정의
+VCS_TOP           = test
+HDL_FILE_LIST     = files.vc
 
-OBJS                := $(VPROC_C_OBJS) $(VPROC_CPP_OBJS) $(USER_C_OBJS) $(USER_CPP_OBJS)
+VCSFLAGS          = -full64 -sverilog +v2k \
+                    -debug_acc+all \
+                    +define+VPROC_BURST_IF \
+                    +define+VPROC_BYTE_ENABLE \
+                    +incdir+../ \
+                    -top $(VCS_TOP) \
+                    -l compile.log
 
-#------------------------------ Flags ------------------------------------------
-CSTD                ?= -std=c11
-CXXSTD              ?= -std=c++11
-SIMINCLUDEFLAG      := -I$(VCS_HOME)/include
-INCLUDES            := -I$(SRCDIR) -I$(USRCDIR) $(SIMINCLUDEFLAG)
+SIMVFLAGS         = -l run.log
 
-# (Optional) silence C++ const-string → char* warnings from vpi_printf signature
-CXXWARNFIX          ?= -Wno-write-strings
+#------------------------------------------------------
+# BUILD RULES
+#------------------------------------------------------
 
-CFLAGS              ?= $(OPTFLAG) $(ARCHFLAG) -fPIC $(CSTD)   $(USRFLAGS) $(INCLUDES)
-CXXFLAGS            ?= $(OPTFLAG) $(ARCHFLAG) -fPIC $(CXXSTD) $(USRFLAGS) $(CXXWARNFIX) $(INCLUDES)
+# 'makefile.common'을 포함하여 모든 C/C++ 빌드 규칙을 가져옴
+# 이 include 한 줄이 C/C++ 컴파일 -> .o 생성 -> .a 아카이브 -> .so 공유 라이브러리 생성을 모두 처리함
+include makefile.common
 
-# Shared object link flags (Linux)
-LDFLAGS_SO          ?= -shared $(ARCHFLAG) -lpthread -lrt -rdynamic
+# *** 핵심 변경점 (3) ***
+# HDL 컴파일 타겟 정의. C/C++ 공유 라이브러리($(VPROC_PLI))가 먼저 빌드되도록 의존성 설정
+.PHONY: compile
+compile: $(VPROC_PLI)
+	@echo "### Compiling HDL with VCS and loading VPI library..."
+	@vcs $(VCSFLAGS) -file $(HDL_FILE_LIST) -load $(VPROC_PLI)
 
-# VCS flags (correct macro: BYTE_ENABLE)
-VCSFLAGS            ?= -full64 -sverilog +v2k \
-                       -debug_acc+all \
-                       +define+VPROC_BURST_IF \
-                       +define+VPROC_BYTE_ENABLE \
-                       +incdir+../ \
-                       -top test \
-                       -l compile.log
-SIMVFLAGS           ?= -l run.log
+#------------------------------------------------------
+# EXECUTION RULES (VCS에 맞게 수정)
+#------------------------------------------------------
 
-VLOG_FILELIST       ?= test.vc
-
-#------------------------------ Phony ------------------------------------------
-.PHONY: all compile run sim rungui gui clean show dirs rebuild clobber
-
+# all
 all: compile
 
-rebuild: clobber compile
-
-show:
-	@echo "SRCDIR=$(SRCDIR)"
-	@echo "USRCDIR=$(USRCDIR)"
-	@echo "VOBJDIR=$(VOBJDIR)"
-	@echo "VLIB=$(VLIB)"
-	@echo "VPI_SO=$(VPI_SO)"
-	@echo "VCS_HOME=$(VCS_HOME)"
-	@echo "VLOG_FILELIST=$(VLOG_FILELIST)"
-	@echo "USER_C_SOURCES=$(USER_C_SOURCES)"
-
-dirs:
-	@mkdir -p $(VOBJDIR)
-
-#------------------------------ Build rules ------------------------------------
-$(VOBJDIR)/%.o: $(SRCDIR)/%.c | dirs
-	$(CC) -c $(CFLAGS) -o $@ $<
-
-$(VOBJDIR)/%.o: $(SRCDIR)/%.cpp | dirs
-	$(CXX) -c $(CXXFLAGS) -o $@ $<
-
-$(VOBJDIR)/usr_%.o: $(USRCDIR)/%.c | dirs
-	$(CC) -c $(CFLAGS) -o $@ $<
-
-$(VOBJDIR)/usr_%.o: $(USRCDIR)/%.cpp | dirs
-	$(CXX) -c $(CXXFLAGS) -o $@ $<
-
-# Recreate archive from scratch to avoid stale *.o entries (fix for 'multiple definition')
-$(VLIB): $(OBJS) | dirs
-	@rm -f $@
-	$(AR) rcs $@ $(OBJS)
-
-$(VPI_SO): $(VLIB)
-	$(CXX) $(LDFLAGS_SO) \
-	  -Wl,-whole-archive $(VLIB) -Wl,-no-whole-archive \
-	  -o $@
-
-# HDL compile + VPI load (entry: register_vpi_tasks in VSched.c)
-compile: $(VPI_SO)
-	@echo "### Compiling HDL and linking VPI library with VCS..."
-	@vcs $(VCSFLAGS) -f $(VLOG_FILELIST) \
-	   -loadvpi ./$(notdir $(VPI_SO)):register_vpi_tasks
-
-#------------------------------ Run rules --------------------------------------
+# 대화형 시뮬레이션 (GUI)
 sim: compile
 	@./simv -gui $(SIMVFLAGS)
 
+# 배치(batch) 모드 시뮬레이션 실행
 run: compile
 	@./simv $(SIMVFLAGS)
 
+# GUI 모드 시뮬레이션 실행
 rungui: compile
-	@if [ -e wave.do ]; then \
-		./simv -gui -do wave.do $(SIMVFLAGS); \
-	else \
-		./simv -gui $(SIMVFLAGS); \
-	fi
+	@./simv -gui $(SIMVFLAGS)
 
 gui: rungui
 
-#------------------------------ Clean ------------------------------------------
-clean:
-	@rm -rf $(VOBJDIR) $(VLIB) $(VPI_SO) \
-	        simv simv.daidir csrc ucli.key \
-	        *.log DVEfiles/ *.vpd *.vcd *.fsdb *.vcs.* *.ddb *.simv.*
+help:
+	@$(info make help      Display this message)
+	@$(info make           Build C/C++ and HDL code without running simulation)
+	@$(info make sim       Build and run interactive GUI simulation)
+	@$(info make run       Build and run batch simulation)
+	@$(info make rungui/gui Build and run GUI simulation)
+	@$(info make clean     Clean previous build artifacts)
+	@$(info make clobber   Deep clean all generated files)
 
-# Deep clean convenience
+
+#------------------------------------------------------
+# CLEANING RULES (VCS 생성 파일들 추가)
+#------------------------------------------------------
+
+clean:
+	@rm -rf $(VPROC_PLI) $(VLIB) $(VOBJDIR)
+	@rm -rf simv simv.daidir csrc ucli.key *.log DVEfiles/
+	@rm -rf *.vpd *.vcd *.fsdb *.vcs.* *.ddb *.simv.*
+
 clobber: clean
-	@rm -f $(TESTDIR)/libvproc.a $(TESTDIR)/VProcVCS.so
+	@rm -rf novas.*
